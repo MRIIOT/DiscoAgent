@@ -1,0 +1,7 @@
+node_modules/
+.env
+discord-session/
+*.log
+.DS_Store
+dist/
+build/
