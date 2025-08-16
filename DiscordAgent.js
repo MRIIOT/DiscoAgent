@@ -378,124 +378,47 @@ class DiscordAgent {
                     containerId: messageContainer?.id || 'none'
                 };
                 
-                // Try to find the actual message author (not the replied-to user)
+                // Discord has two patterns for usernames:
+                // 1. Messages with headers: username is in <span id="message-username-XXX">
+                // 2. Continuation messages: no username element, but aria-labelledby references previous message's username
+                
                 let author = 'Unknown';
+                let usernameElementId = null;
+                
                 if (messageContainer) {
-                    // Method 1: Look for username element with specific ID pattern
-                    const usernameById = messageContainer.querySelector('[id^="message-username-"]');
-                    if (usernameById && !usernameById.closest('.repliedMessage_c19a55')) {
-                        // Get text content, could be in a child element
-                        const usernameSpan = usernameById.querySelector('.username_c19a55') || usernameById;
-                        author = usernameSpan.textContent.trim();
-                        debugInfo.method1 = `Found by ID: ${author}`;
-                    }
-                    
-                    // Method 2: If that fails, look in the header
-                    if (author === 'Unknown') {
-                        const headerElement = messageContainer.querySelector('.header_c19a55');
-                        if (headerElement) {
-                            const usernameInHeader = headerElement.querySelector('.username_c19a55');
-                            if (usernameInHeader && !usernameInHeader.closest('.repliedMessage_c19a55')) {
-                                author = usernameInHeader.textContent.trim();
-                                debugInfo.method2 = `Found in header: ${author}`;
-                            } else {
-                                debugInfo.method2 = 'Header found but no username';
-                            }
-                        } else {
-                            debugInfo.method2 = 'No header found';
+                    // Pattern 1: Look for username element with ID (messages with headers)
+                    const usernameElement = messageContainer.querySelector('[id^="message-username-"]');
+                    if (usernameElement && !usernameElement.closest('.repliedMessage_c19a55')) {
+                        // Find the actual username span within this element
+                        const usernameSpan = usernameElement.querySelector('.username_c19a55');
+                        if (usernameSpan) {
+                            author = usernameSpan.textContent.trim();
+                            usernameElementId = usernameElement.id;
+                            debugInfo.method = `Found username in header: ${author}`;
                         }
                     }
                     
-                    // Method 3: Look for any span with username class
+                    // Pattern 2: For continuation messages, check aria-labelledby
                     if (author === 'Unknown') {
-                        const allUsernames = messageContainer.querySelectorAll('.username_c19a55');
-                        debugInfo.usernameCount = allUsernames.length;
-                        for (const elem of allUsernames) {
-                            // Skip if it's inside reply context
-                            if (!elem.closest('.repliedMessage_c19a55')) {
-                                const text = elem.textContent.trim();
-                                // Skip if it's a mention (starts with @)
-                                if (text && !text.startsWith('@')) {
-                                    author = text;
-                                    debugInfo.method3 = `Found username: ${author}`;
-                                    break;
-                                }
+                        const ariaLabelledBy = messageContainer.getAttribute('aria-labelledby');
+                        if (ariaLabelledBy) {
+                            // Extract the username element ID from aria-labelledby
+                            // Format: "message-username-XXX uid_1 message-content-YYY uid_2 message-timestamp-ZZZ"
+                            const parts = ariaLabelledBy.split(' ');
+                            const usernameId = parts.find(part => part.startsWith('message-username-'));
+                            
+                            if (usernameId) {
+                                // This is a continuation message, store the reference
+                                debugInfo.continuationRef = usernameId;
+                                debugInfo.method = 'Continuation message - will use previous author';
+                                // Author will be resolved later using message history
                             }
                         }
                     }
                     
-                    // Method 4: Look for any element with aria-label containing username
+                    // Log debugging info for unknown authors
                     if (author === 'Unknown') {
-                        const ariaLabels = messageContainer.querySelectorAll('[aria-label]');
-                        for (const elem of ariaLabels) {
-                            const label = elem.getAttribute('aria-label');
-                            if (label && label.includes('username')) {
-                                author = elem.textContent.trim() || label.split(',')[0].trim();
-                                if (author && author !== 'Unknown') {
-                                    debugInfo.method4 = `Found by aria-label: ${author}`;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Method 5: Look for author in message header without specific class
-                    if (author === 'Unknown') {
-                        const possibleHeaders = messageContainer.querySelectorAll('h3, [class*="username"], [class*="author"], [class*="name"]');
-                        for (const elem of possibleHeaders) {
-                            if (!elem.closest('.repliedMessage_c19a55') && !elem.closest('[class*="reply"]')) {
-                                const text = elem.textContent.trim();
-                                if (text && !text.startsWith('@') && text.length < 50) { // Reasonable username length
-                                    author = text;
-                                    debugInfo.method5 = `Found by class pattern: ${author}`;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Method 6: Look for img alt text (avatar username)
-                    if (author === 'Unknown') {
-                        const avatarImg = messageContainer.querySelector('img[alt]');
-                        if (avatarImg) {
-                            const altText = avatarImg.getAttribute('alt');
-                            if (altText && altText.length < 50 && !altText.includes('avatar')) {
-                                author = altText;
-                                debugInfo.method6 = `Found by avatar alt: ${author}`;
-                            }
-                        }
-                    }
-                    
-                    // Method 7: Look for any h3 element OUTSIDE message content (Discord often uses h3 for usernames)
-                    if (author === 'Unknown') {
-                        const h3Elements = messageContainer.querySelectorAll('h3');
-                        for (const h3 of h3Elements) {
-                            // Skip h3 elements that are inside the actual message content
-                            if (h3.closest('[id^="message-content-"]') || h3.closest('.messageContent_c19a55')) {
-                                continue; // This h3 is part of the message content, not the author
-                            }
-                            const text = h3.textContent.trim();
-                            if (text && text.length < 50 && !text.startsWith('@')) {
-                                author = text;
-                                debugInfo.method7 = `Found in h3: ${author}`;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // Log debugging info
-                    if (author === 'Unknown') {
-                        console.log('Failed to find author. Debug info:', JSON.stringify(debugInfo));
-                        // Log all classes in container for analysis
-                        const allClasses = Array.from(messageContainer.querySelectorAll('*'))
-                            .map(e => e.className)
-                            .filter(c => {
-                                // Ensure c is a string before calling includes
-                                const className = typeof c === 'string' ? c : String(c || '');
-                                return className && (className.includes('username') || className.includes('author') || className.includes('name'));
-                            })
-                            .slice(0, 5);
-                        console.log('Username-related classes found:', allClasses);
+                        console.log('Author detection:', JSON.stringify(debugInfo));
                     }
                 }
                 
@@ -505,6 +428,7 @@ class DiscordAgent {
                     id: el.id,
                     content: el.textContent.trim(),
                     author: author,
+                    usernameElementId: usernameElementId,
                     timestamp: timestampElement?.getAttribute('datetime') || new Date().toISOString()
                 });
             });
@@ -522,43 +446,54 @@ class DiscordAgent {
             });
         }
         
-        // On startup, trace back to find the last known author
-        // This helps with continuation messages that don't show usernames
+        // Build a map of username element IDs to authors for resolving continuation messages
+        const usernameMap = {};
+        for (const msg of messages) {
+            if (msg.author !== 'Unknown' && msg.usernameElementId) {
+                usernameMap[msg.usernameElementId] = msg.author;
+            }
+        }
+        
+        // Resolve Unknown authors from continuation messages
+        for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
+            
+            if (msg.author === 'Unknown') {
+                // For continuation messages, the aria-labelledby might reference a previous message's username
+                // We need to look at previous messages to find the author
+                let resolvedAuthor = null;
+                
+                // Look backwards for the most recent message with a known author
+                for (let j = i - 1; j >= 0; j--) {
+                    if (messages[j].author !== 'Unknown' && messages[j].author !== this.botName) {
+                        resolvedAuthor = messages[j].author;
+                        break;
+                    }
+                }
+                
+                // If we couldn't find it by looking back, use the last known author
+                if (!resolvedAuthor && this.lastKnownAuthor) {
+                    resolvedAuthor = this.lastKnownAuthor;
+                }
+                
+                if (resolvedAuthor) {
+                    msg.author = resolvedAuthor;
+                    this.logger.debug(`Resolved continuation message author: ${resolvedAuthor}`);
+                }
+            } else if (msg.author !== 'Unknown' && msg.author !== this.botName) {
+                // Update last known author for future continuation messages
+                this.lastKnownAuthor = msg.author;
+            }
+        }
+        
+        // On startup, ensure we have a last known author
         if (!this.lastKnownAuthor && messages.length > 0) {
-            this.logger.info('No last known author, tracing back through messages to find one...');
-            // Go through messages in reverse to find the most recent author
             for (let i = messages.length - 1; i >= 0; i--) {
                 const msg = messages[i];
                 if (msg.author && msg.author !== 'Unknown' && msg.author !== this.botName) {
                     this.lastKnownAuthor = msg.author;
-                    this.logger.info(`Found last known author by tracing back: ${this.lastKnownAuthor}`);
+                    this.logger.info(`Found last known author on startup: ${this.lastKnownAuthor}`);
                     break;
-                }
-            }
-            
-            if (!this.lastKnownAuthor) {
-                this.logger.warn('Could not find any valid author in message history');
-            }
-        }
-        
-        // Now apply the lastKnownAuthor to any Unknown messages
-        // This handles continuation messages that don't have author elements
-        if (this.lastKnownAuthor) {
-            for (let i = 0; i < messages.length; i++) {
-                const msg = messages[i];
-                if (msg.author === 'Unknown') {
-                    // Check if previous message has a known author
-                    if (i > 0 && messages[i-1].author !== 'Unknown' && messages[i-1].author !== this.botName) {
-                        msg.author = messages[i-1].author;
-                        this.logger.debug(`Applied author from previous message: ${msg.author}`);
-                    } else {
-                        // Use the last known author
-                        msg.author = this.lastKnownAuthor;
-                        this.logger.debug(`Applied last known author to Unknown message: ${this.lastKnownAuthor}`);
-                    }
-                } else if (msg.author !== 'Unknown' && msg.author !== this.botName) {
-                    // Update last known author as we go through messages
-                    this.lastKnownAuthor = msg.author;
                 }
             }
         }
