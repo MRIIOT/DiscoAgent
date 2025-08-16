@@ -1,11 +1,10 @@
 const { chromium } = require('playwright');
-const winston = require('winston');
-const AgentFactory = require('./agents/AgentFactory');
 
 class DiscordAgent {
-    constructor(config, logger) {
+    constructor(config, logger, agent) {
         this.config = config;  // Store the full config for later use
         this.logger = logger;
+        this.agent = agent;  // AI agent passed as dependency
         this.discordEmail = config.discordEmail;
         this.discordPassword = config.discordPassword;
         this.targetChannel = config.targetChannel;
@@ -21,23 +20,11 @@ class DiscordAgent {
         this.isStartup = true;  // Track if this is the first message fetch after startup
         this.startupMessageLimit = config.startupMessageLimit !== undefined ? config.startupMessageLimit : 3; // Default to 3, can be set to 0
         this.lastMessageAuthor = null;  // Track the last message author for response formatting
-        
-        // AI Agent configuration
-        this.agentType = config.agentType || 'claude';  // Default to Claude
-        this.agent = null;  // Will be initialized in initialize()
     }
 
     async initialize() {
         this.logger.info('Initializing Discord Agent...');
         this.logger.info('Browser launch configuration: headless=false, persistent session=./discord-session');
-        
-        // Initialize the AI agent
-        this.agent = AgentFactory.createAgent(this.agentType, {
-            ...this.config,
-            targetChannel: this.targetChannel,
-            logger: this.logger
-        });
-        await this.agent.loadSessions();
         
         try {
             const context = await chromium.launchPersistentContext('./discord-session', {
@@ -683,7 +670,7 @@ class DiscordAgent {
         this.lastMessageAuthor = message.author;
         
         try {
-            this.logger.info(`Processing message with ${this.agentType}: ${message.content.substring(0, 50)}...`);
+            this.logger.info(`Processing message with agent: ${message.content.substring(0, 50)}...`);
             
             // Process message with the AI agent
             const result = await this.agent.processMessage(message);

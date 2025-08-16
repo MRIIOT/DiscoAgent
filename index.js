@@ -1,5 +1,6 @@
 const winston = require('winston');
 const DiscordAgent = require('./DiscordAgent');
+const AgentFactory = require('./agents/AgentFactory');
 require('dotenv').config();
 
 const logger = winston.createLogger({
@@ -68,19 +69,30 @@ async function main() {
         process.exit(1);
     }
 
-    const agent = new DiscordAgent(config, logger);
+    // Create the AI agent first
+    const aiAgent = AgentFactory.createAgent(config.agentType, {
+        ...config,
+        targetChannel: config.targetChannel,
+        logger: logger
+    });
+    
+    // Load agent sessions
+    await aiAgent.loadSessions();
+    
+    // Create Discord agent with the AI agent as a dependency
+    const discordAgent = new DiscordAgent(config, logger, aiAgent);
 
     process.on('SIGINT', async () => {
         logger.info('Received shutdown signal...');
-        await agent.cleanup();
+        await discordAgent.cleanup();
         process.exit(0);
     });
 
     try {
-        await agent.run();
+        await discordAgent.run();
     } catch (error) {
         logger.error(`Fatal error: ${error.message}`);
-        await agent.cleanup();
+        await discordAgent.cleanup();
         process.exit(1);
     }
 }
