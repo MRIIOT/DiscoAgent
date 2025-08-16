@@ -1,5 +1,6 @@
 const winston = require('winston');
 const DiscordAgent = require('./DiscordAgent');
+const ChatOrchestrator = require('./ChatOrchestrator');
 const AgentFactory = require('./agents/AgentFactory');
 require('dotenv').config();
 
@@ -37,7 +38,8 @@ async function main() {
         startupMessageLimit: process.env.STARTUP_MESSAGE_LIMIT !== undefined ? parseInt(process.env.STARTUP_MESSAGE_LIMIT) : 0  // Default to 0, can be 0 to skip all, or -1 to process all
     };
     
-    // Log agent type
+    // Log configuration
+    logger.info('=== CHAT BOT CONFIGURATION ===');
     logger.info(`🤖 AGENT TYPE: ${config.agentType.toUpperCase()}`);
     
     if (config.testingMode) {
@@ -69,30 +71,44 @@ async function main() {
         process.exit(1);
     }
 
-    // Create the AI agent first
+    // Create the AI agent
+    logger.info('Creating AI agent...');
     const aiAgent = AgentFactory.createAgent(config.agentType, {
         ...config,
         targetChannel: config.targetChannel,
         logger: logger
     });
     
-    // Load agent sessions
-    await aiAgent.loadSessions();
+    // Create the Discord chat platform
+    logger.info('Creating Discord platform agent...');
+    const discordAgent = new DiscordAgent(config, logger);
     
-    // Create Discord agent with the AI agent as a dependency
-    const discordAgent = new DiscordAgent(config, logger, aiAgent);
+    // Create the orchestrator to manage both
+    logger.info('Creating orchestrator...');
+    const orchestrator = new ChatOrchestrator(
+        discordAgent,
+        aiAgent,
+        logger,
+        {
+            testingMode: config.testingMode,
+            filterMentions: config.filterMentions
+        }
+    );
 
+    // Handle shutdown gracefully
     process.on('SIGINT', async () => {
         logger.info('Received shutdown signal...');
-        await discordAgent.cleanup();
+        await orchestrator.cleanup();
         process.exit(0);
     });
 
     try {
-        await discordAgent.run();
+        // Initialize and run the orchestrator
+        await orchestrator.initialize();
+        await orchestrator.run();
     } catch (error) {
         logger.error(`Fatal error: ${error.message}`);
-        await discordAgent.cleanup();
+        await orchestrator.cleanup();
         process.exit(1);
     }
 }

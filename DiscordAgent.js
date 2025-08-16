@@ -1,10 +1,9 @@
 const { chromium } = require('playwright');
 
 class DiscordAgent {
-    constructor(config, logger, agent) {
+    constructor(config, logger) {
         this.config = config;  // Store the full config for later use
         this.logger = logger;
-        this.agent = agent;  // AI agent passed as dependency
         this.discordEmail = config.discordEmail;
         this.discordPassword = config.discordPassword;
         this.targetChannel = config.targetChannel;
@@ -15,11 +14,8 @@ class DiscordAgent {
         this.botName = config.botName || 'ClaudeAgent';
         this.responseDelay = config.responseDelay || 2000;
         this.skip2FA = config.skip2FA || false;
-        this.testingMode = config.testingMode || false;
-        this.filterMentions = config.filterMentions || null;
         this.isStartup = true;  // Track if this is the first message fetch after startup
         this.startupMessageLimit = config.startupMessageLimit !== undefined ? config.startupMessageLimit : 3; // Default to 3, can be set to 0
-        this.lastMessageAuthor = null;  // Track the last message author for response formatting
     }
 
     async initialize() {
@@ -386,9 +382,11 @@ class DiscordAgent {
                 let author = 'Unknown';
                 if (messageContainer) {
                     // Method 1: Look for username element with specific ID pattern
-                    const usernameById = messageContainer.querySelector('[id^="message-username-"] .username_c19a55');
+                    const usernameById = messageContainer.querySelector('[id^="message-username-"]');
                     if (usernameById && !usernameById.closest('.repliedMessage_c19a55')) {
-                        author = usernameById.textContent.trim();
+                        // Get text content, could be in a child element
+                        const usernameSpan = usernameById.querySelector('.username_c19a55') || usernameById;
+                        author = usernameSpan.textContent.trim();
                         debugInfo.method1 = `Found by ID: ${author}`;
                     }
                     
@@ -468,10 +466,14 @@ class DiscordAgent {
                         }
                     }
                     
-                    // Method 7: Look for any h3 element (Discord often uses h3 for usernames)
+                    // Method 7: Look for any h3 element OUTSIDE message content (Discord often uses h3 for usernames)
                     if (author === 'Unknown') {
                         const h3Elements = messageContainer.querySelectorAll('h3');
                         for (const h3 of h3Elements) {
+                            // Skip h3 elements that are inside the actual message content
+                            if (h3.closest('[id^="message-content-"]') || h3.closest('.messageContent_c19a55')) {
+                                continue; // This h3 is part of the message content, not the author
+                            }
                             const text = h3.textContent.trim();
                             if (text && text.length < 50 && !text.startsWith('@')) {
                                 author = text;
@@ -487,7 +489,11 @@ class DiscordAgent {
                         // Log all classes in container for analysis
                         const allClasses = Array.from(messageContainer.querySelectorAll('*'))
                             .map(e => e.className)
-                            .filter(c => c && c.includes('username') || c.includes('author') || c.includes('name'))
+                            .filter(c => {
+                                // Ensure c is a string before calling includes
+                                const className = typeof c === 'string' ? c : String(c || '');
+                                return className && (className.includes('username') || className.includes('author') || className.includes('name'));
+                            })
                             .slice(0, 5);
                         console.log('Username-related classes found:', allClasses);
                     }
@@ -638,10 +644,19 @@ class DiscordAgent {
         
         const chunks = this.splitMessage(text);
         
-        for (const chunk of chunks) {
-            await messageBox.fill(chunk);
+        for (let i = 0; i < chunks.length; i++) {
+            // Apply response delay before sending each chunk
+            if (this.responseDelay > 0) {
+                await this.page.waitForTimeout(this.responseDelay);
+            }
+            
+            await messageBox.fill(chunks[i]);
             await messageBox.press('Enter');
-            await this.page.waitForTimeout(500);
+            
+            // Small delay between chunks if there are multiple
+            if (i < chunks.length - 1) {
+                await this.page.waitForTimeout(500);
+            }
         }
     }
 
@@ -665,101 +680,16 @@ class DiscordAgent {
         return chunks;
     }
 
-    async processWithAgent(message) {
-        // Store the message author for response formatting
-        this.lastMessageAuthor = message.author;
-        
-        try {
-            this.logger.info(`Processing message with agent: ${message.content.substring(0, 50)}...`);
-            
-            // Process message with the AI agent
-            const result = await this.agent.processMessage(message);
-            
-            if (!result) {
-                this.logger.warn('Agent returned null response');
-                return null;
-            }
-            
-            if (result.isError) {
-                this.logger.error(`Agent error: ${result.result}`);
-                return this.agent.formatError(message.author, result.result);
-            }
-            
-            // Format the response with author mention and cost
-            const formattedResponse = this.agent.formatResponse(
-                message.author,
-                result.cost || 0,
-                result.result
-            );
-            
-            this.logger.info(`Response cost: $${(result.cost || 0).toFixed(2)}`);
-            return formattedResponse;
-            
-        } catch (error) {
-            this.logger.error(`Agent processing error: ${error.message}`);
-            this.logger.error(`Error details: ${error.stack}`);
-            
-            return this.agent.formatError(
-                message.author,
-                `Sorry, I encountered an error processing your message: ${error.message}`
-            );
-        }
+    isOwnMessage(message) {
+        // Check if a message is from the bot itself
+        return message.author === this.botName;
     }
 
-    async run() {
-        await this.initialize();
-        
-        this.logger.info('Starting message monitoring loop...');
-        
-        while (true) {
-            try {
-                const newMessages = await this.getNewMessages();
-                
-                // After the first message fetch, disable startup mode
-                if (this.isStartup) {
-                    this.isStartup = false;
-                    this.logger.info('Startup message processing complete. Switching to normal operation mode.');
-                }
-                
-                for (const msg of newMessages) {
-                    // Skip messages FROM the filtered user to prevent loops
-                    if (this.filterMentions && msg.author.toLowerCase() === this.filterMentions.toLowerCase()) {
-                        this.logger.debug(`Skipping message FROM ${this.filterMentions} to prevent loop`);
-                        continue;
-                    }
-                    
-                    this.logger.info(`New message from ${msg.author}: ${msg.content}`);
-                    
-                    // Process ALL messages with the AI agent
-                    const response = await this.processWithAgent(msg);
-                    
-                    if (response) {
-                        // Check if message mentions the filter target
-                        const shouldSendToDiscord = !this.filterMentions || 
-                            msg.content.toLowerCase().includes(this.filterMentions.toLowerCase()) ||
-                            msg.content.includes(`@${this.filterMentions}`);
-                        
-                        if (this.testingMode || !shouldSendToDiscord) {
-                            // Log to console only (testing mode OR no mention)
-                            const reason = this.testingMode ? 'TESTING MODE' : 'NO MENTION';
-                            this.logger.info(`==== AGENT RESPONSE (${reason} - NOT SENT) ====`);
-                            this.logger.info(response);
-                            this.logger.info('====================================================');
-                        } else {
-                            // Send to Discord (production mode AND has mention)
-                            await this.page.waitForTimeout(this.responseDelay);
-                            await this.sendMessage(response);
-                            this.logger.info(`Sent response to Discord: ${response.substring(0, 100)}...`);
-                        }
-                    }
-                }
-                
-                await this.page.waitForTimeout(2000);
-                
-            } catch (error) {
-                this.logger.error(`Loop error: ${error.message}`);
-                await this.page.waitForTimeout(5000);
-            }
+    async markStartupComplete() {
+        // Call this after the first message fetch to disable startup mode
+        if (this.isStartup) {
+            this.isStartup = false;
+            this.logger.info('Startup message processing complete. Switching to normal operation mode.');
         }
     }
 

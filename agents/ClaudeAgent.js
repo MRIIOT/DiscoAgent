@@ -59,9 +59,9 @@ class ClaudeAgent extends BaseAgent {
             this.logger.info(`Full command: ${command}`);
             
             const { stdout, stderr } = await execAsync(command, {
-                maxBuffer: 1024 * 1024 * 10,
-                timeout: 60000,
-                windowsHide: true,
+                //maxBuffer: 1024 * 1024 * 10,
+                timeout: 600000,
+                windowsHide: false,
                 shell: process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
             });
             
