@@ -5,3 +5,4 @@ discord-session/
 .DS_Store
 dist/
 build/
+claude-sessions.json

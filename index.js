@@ -1,16 +1,10 @@
 const { chromium } = require('playwright');
-const { exec, spawn } = require('child_process');
-const { promisify } = require('util');
-const fs = require('fs').promises;
-const path = require('path');
-const os = require('os');
 const winston = require('winston');
+const AgentFactory = require('./agents/AgentFactory');
 require('dotenv').config();
 
-const execAsync = promisify(exec);
-
 const logger = winston.createLogger({
-    level: 'info',
+    level: process.env.DEBUG === 'true' ? 'debug' : 'info',
     format: winston.format.combine(
         winston.format.timestamp(),
         winston.format.printf(({ timestamp, level, message }) => {
@@ -25,6 +19,7 @@ const logger = winston.createLogger({
 
 class DiscordAgent {
     constructor(config) {
+        this.config = config;  // Store the full config for later use
         this.discordEmail = config.discordEmail;
         this.discordPassword = config.discordPassword;
         this.targetChannel = config.targetChannel;
@@ -34,18 +29,28 @@ class DiscordAgent {
         this.lastKnownAuthor = null;  // Track the last known author
         this.botName = config.botName || 'ClaudeAgent';
         this.responseDelay = config.responseDelay || 2000;
-        this.claudeModel = config.claudeModel || 'sonnet';
-        this.claudeMaxTurns = config.claudeMaxTurns || 5;
         this.skip2FA = config.skip2FA || false;
         this.testingMode = config.testingMode || false;
         this.filterMentions = config.filterMentions || null;
-        this.claudeSessionId = null;  // Track Claude session for conversation continuity
-        this.useConversationMode = config.useConversationMode !== false; // Default to true
+        this.isStartup = true;  // Track if this is the first message fetch after startup
+        this.startupMessageLimit = config.startupMessageLimit !== undefined ? config.startupMessageLimit : 3; // Default to 3, can be set to 0
+        this.lastMessageAuthor = null;  // Track the last message author for response formatting
+        
+        // AI Agent configuration
+        this.agentType = config.agentType || 'claude';  // Default to Claude
+        this.agent = null;  // Will be initialized in initialize()
     }
 
     async initialize() {
         logger.info('Initializing Discord Agent...');
         logger.info('Browser launch configuration: headless=false, persistent session=./discord-session');
+        
+        // Initialize the AI agent
+        this.agent = AgentFactory.createAgent(this.agentType, {
+            ...this.config,
+            targetChannel: this.targetChannel
+        });
+        await this.agent.loadSessions();
         
         try {
             const context = await chromium.launchPersistentContext('./discord-session', {
@@ -66,12 +71,21 @@ class DiscordAgent {
                 this.page = await context.newPage();
             }
             
-            logger.info('Navigating to Discord app...');
-            await this.page.goto('https://discord.com/app', { waitUntil: 'domcontentloaded' });
-            logger.info(`Page loaded. Current URL: ${this.page.url()}`);
+            // Check current URL before navigation
+            const startUrl = this.page.url();
+            logger.info(`Starting URL: ${startUrl}`);
             
-            // Wait a bit for any redirects
-            await this.page.waitForTimeout(2000);
+            // If we're already on Discord and logged in, don't navigate
+            if (startUrl.includes('discord.com') && startUrl.includes('channels')) {
+                logger.info('Already on Discord channels page, skipping navigation');
+            } else {
+                logger.info('Navigating to Discord app...');
+                await this.page.goto('https://discord.com/app', { waitUntil: 'domcontentloaded' });
+                logger.info(`Page loaded. Current URL: ${this.page.url()}`);
+                
+                // Wait a bit for any redirects
+                await this.page.waitForTimeout(3000);
+            }
             
             const currentUrl = this.page.url();
             logger.info(`After redirect check - Current URL: ${currentUrl}`);
@@ -83,20 +97,70 @@ class DiscordAgent {
             } else if (currentUrl.includes('channels')) {
                 logger.info('Already logged in, found channels in URL');
             } else {
-                logger.info(`Unexpected URL state: ${currentUrl}`);
-                // Try to detect if we're logged in by looking for channel elements
-                const hasChannels = await this.page.locator('[data-list-id="channels"]').count() > 0;
-                if (hasChannels) {
-                    logger.info('Channels list found - appears to be logged in');
+                logger.info(`Checking login state at URL: ${currentUrl}`);
+                
+                // Wait a bit longer for page to fully load
+                await this.page.waitForTimeout(2000);
+                
+                // Try multiple ways to detect if we're logged in
+                const loggedInIndicators = [
+                    this.page.locator('[data-list-id="channels"]').first(),
+                    this.page.locator('[class*="sidebar"]').first(),
+                    this.page.locator('[aria-label*="Server"]').first(),
+                    this.page.locator('[role="navigation"]').first()
+                ];
+                
+                let isLoggedIn = false;
+                for (const indicator of loggedInIndicators) {
+                    try {
+                        if (await indicator.isVisible({ timeout: 2000 })) {
+                            isLoggedIn = true;
+                            logger.info(`Found logged-in indicator: ${await indicator.evaluate(el => el.tagName + '.' + el.className)}`);
+                            break;
+                        }
+                    } catch (e) {
+                        // Continue checking other indicators
+                    }
+                }
+                
+                if (isLoggedIn) {
+                    logger.info('Successfully detected logged-in state');
                 } else {
-                    logger.info('No channels found - may need to login');
-                    await this.page.goto('https://discord.com/login');
-                    await this.login();
+                    logger.info('No logged-in indicators found - navigating to login page');
+                    await this.page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded' });
+                    
+                    // Double-check if we actually need to login
+                    await this.page.waitForTimeout(2000);
+                    const loginUrl = this.page.url();
+                    
+                    if (loginUrl.includes('channels')) {
+                        logger.info('Redirected to channels - already logged in!');
+                    } else if (loginUrl.includes('login')) {
+                        logger.info('Confirmed on login page - proceeding with authentication');
+                        await this.login();
+                    } else {
+                        logger.warn(`Unexpected state after login navigation: ${loginUrl}`);
+                        // Try to proceed anyway
+                    }
                 }
             }
             
-            await this.navigateToChannel();
-            logger.info(`Successfully connected to channel: ${this.targetChannel}`);
+            // Try to navigate to channel
+            try {
+                await this.navigateToChannel();
+                logger.info(`Successfully connected to channel: ${this.targetChannel}`);
+            } catch (navError) {
+                logger.error(`Failed to navigate to channel: ${navError.message}`);
+                
+                // Last resort - try direct navigation if we have a URL
+                if (this.targetChannel.startsWith('http')) {
+                    logger.info('Attempting direct navigation to channel URL...');
+                    await this.page.goto(this.targetChannel, { waitUntil: 'domcontentloaded' });
+                    await this.page.waitForTimeout(3000);
+                } else {
+                    throw navError;
+                }
+            }
             
         } catch (error) {
             logger.error(`Initialization error: ${error.message}`);
@@ -109,10 +173,31 @@ class DiscordAgent {
         logger.info(`Login URL: ${this.page.url()}`);
         
         try {
+            // First check if we're actually on the login page
+            const currentUrl = this.page.url();
+            if (!currentUrl.includes('login')) {
+                logger.info('Not on login page, checking if already logged in...');
+                if (currentUrl.includes('channels')) {
+                    logger.info('Already logged in (URL contains channels)');
+                    return;
+                }
+            }
+            
             // Wait for login form to be visible
             logger.info('Waiting for email input field...');
-            await this.page.waitForSelector('input[name="email"]', { timeout: 10000 });
-            logger.info('Email input field found');
+            
+            try {
+                await this.page.waitForSelector('input[name="email"]', { timeout: 5000 });
+                logger.info('Email input field found');
+            } catch (timeoutError) {
+                // Check if we got redirected while waiting
+                const newUrl = this.page.url();
+                if (newUrl.includes('channels')) {
+                    logger.info('Redirected to channels during login wait - already logged in');
+                    return;
+                }
+                throw timeoutError;
+            }
             
             // Check if password field is also present
             const hasPasswordField = await this.page.locator('input[name="password"]').count() > 0;
@@ -197,6 +282,7 @@ class DiscordAgent {
             throw error;
         }
     }
+
 
     async navigateToChannel() {
         logger.info(`Attempting to navigate to channel: ${this.targetChannel}`);
@@ -303,23 +389,133 @@ class DiscordAgent {
             const messageList = [];
             
             messageElements.forEach(el => {
+                // Skip if this is a reply preview content
+                if (el.classList.contains('repliedTextContent_c19a55')) {
+                    return;
+                }
+                
                 // Try multiple ways to find the message container and author
                 const messageContainer = el.closest('[id^="chat-messages-"]') || 
                                        el.closest('[class*="message-"]') || 
                                        el.closest('[class*="message"]') ||
                                        el.closest('li');
                 
-                // Try multiple selectors for username
+                // Debug logging
+                const debugInfo = {
+                    messageId: el.id,
+                    containerFound: !!messageContainer,
+                    containerClasses: messageContainer?.className || 'none',
+                    containerId: messageContainer?.id || 'none'
+                };
+                
+                // Try to find the actual message author (not the replied-to user)
                 let author = 'Unknown';
                 if (messageContainer) {
-                    const usernameElement = messageContainer.querySelector('[class*="username-"]') ||
-                                          messageContainer.querySelector('[class*="username"]') ||
-                                          messageContainer.querySelector('[class*="headerText-"] span') ||
-                                          messageContainer.querySelector('h3 span[class*="username"]') ||
-                                          messageContainer.querySelector('[id^="message-username-"]');
+                    // Method 1: Look for username element with specific ID pattern
+                    const usernameById = messageContainer.querySelector('[id^="message-username-"] .username_c19a55');
+                    if (usernameById && !usernameById.closest('.repliedMessage_c19a55')) {
+                        author = usernameById.textContent.trim();
+                        debugInfo.method1 = `Found by ID: ${author}`;
+                    }
                     
-                    if (usernameElement) {
-                        author = usernameElement.textContent.trim();
+                    // Method 2: If that fails, look in the header
+                    if (author === 'Unknown') {
+                        const headerElement = messageContainer.querySelector('.header_c19a55');
+                        if (headerElement) {
+                            const usernameInHeader = headerElement.querySelector('.username_c19a55');
+                            if (usernameInHeader && !usernameInHeader.closest('.repliedMessage_c19a55')) {
+                                author = usernameInHeader.textContent.trim();
+                                debugInfo.method2 = `Found in header: ${author}`;
+                            } else {
+                                debugInfo.method2 = 'Header found but no username';
+                            }
+                        } else {
+                            debugInfo.method2 = 'No header found';
+                        }
+                    }
+                    
+                    // Method 3: Look for any span with username class
+                    if (author === 'Unknown') {
+                        const allUsernames = messageContainer.querySelectorAll('.username_c19a55');
+                        debugInfo.usernameCount = allUsernames.length;
+                        for (const elem of allUsernames) {
+                            // Skip if it's inside reply context
+                            if (!elem.closest('.repliedMessage_c19a55')) {
+                                const text = elem.textContent.trim();
+                                // Skip if it's a mention (starts with @)
+                                if (text && !text.startsWith('@')) {
+                                    author = text;
+                                    debugInfo.method3 = `Found username: ${author}`;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Method 4: Look for any element with aria-label containing username
+                    if (author === 'Unknown') {
+                        const ariaLabels = messageContainer.querySelectorAll('[aria-label]');
+                        for (const elem of ariaLabels) {
+                            const label = elem.getAttribute('aria-label');
+                            if (label && label.includes('username')) {
+                                author = elem.textContent.trim() || label.split(',')[0].trim();
+                                if (author && author !== 'Unknown') {
+                                    debugInfo.method4 = `Found by aria-label: ${author}`;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Method 5: Look for author in message header without specific class
+                    if (author === 'Unknown') {
+                        const possibleHeaders = messageContainer.querySelectorAll('h3, [class*="username"], [class*="author"], [class*="name"]');
+                        for (const elem of possibleHeaders) {
+                            if (!elem.closest('.repliedMessage_c19a55') && !elem.closest('[class*="reply"]')) {
+                                const text = elem.textContent.trim();
+                                if (text && !text.startsWith('@') && text.length < 50) { // Reasonable username length
+                                    author = text;
+                                    debugInfo.method5 = `Found by class pattern: ${author}`;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Method 6: Look for img alt text (avatar username)
+                    if (author === 'Unknown') {
+                        const avatarImg = messageContainer.querySelector('img[alt]');
+                        if (avatarImg) {
+                            const altText = avatarImg.getAttribute('alt');
+                            if (altText && altText.length < 50 && !altText.includes('avatar')) {
+                                author = altText;
+                                debugInfo.method6 = `Found by avatar alt: ${author}`;
+                            }
+                        }
+                    }
+                    
+                    // Method 7: Look for any h3 element (Discord often uses h3 for usernames)
+                    if (author === 'Unknown') {
+                        const h3Elements = messageContainer.querySelectorAll('h3');
+                        for (const h3 of h3Elements) {
+                            const text = h3.textContent.trim();
+                            if (text && text.length < 50 && !text.startsWith('@')) {
+                                author = text;
+                                debugInfo.method7 = `Found in h3: ${author}`;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Log debugging info
+                    if (author === 'Unknown') {
+                        console.log('Failed to find author. Debug info:', JSON.stringify(debugInfo));
+                        // Log all classes in container for analysis
+                        const allClasses = Array.from(messageContainer.querySelectorAll('*'))
+                            .map(e => e.className)
+                            .filter(c => c && c.includes('username') || c.includes('author') || c.includes('name'))
+                            .slice(0, 5);
+                        console.log('Username-related classes found:', allClasses);
                     }
                 }
                 
@@ -336,28 +532,101 @@ class DiscordAgent {
             return messageList;
         });
 
+        // Log raw messages for debugging
+        if (messages.length > 0) {
+            logger.debug(`Retrieved ${messages.length} total messages from page`);
+            // Log the last few messages for debugging
+            const recentMessages = messages.slice(-3);
+            recentMessages.forEach(msg => {
+                logger.debug(`Message ${msg.id}: Author="${msg.author}", Content="${msg.content.substring(0, 50)}..."`);
+            });
+        }
+        
+        // On startup, trace back to find the last known author
+        // This helps with continuation messages that don't show usernames
+        if (!this.lastKnownAuthor && messages.length > 0) {
+            logger.info('No last known author, tracing back through messages to find one...');
+            // Go through messages in reverse to find the most recent author
+            for (let i = messages.length - 1; i >= 0; i--) {
+                const msg = messages[i];
+                if (msg.author && msg.author !== 'Unknown' && msg.author !== this.botName) {
+                    this.lastKnownAuthor = msg.author;
+                    logger.info(`Found last known author by tracing back: ${this.lastKnownAuthor}`);
+                    break;
+                }
+            }
+            
+            if (!this.lastKnownAuthor) {
+                logger.warn('Could not find any valid author in message history');
+            }
+        }
+        
+        // Now apply the lastKnownAuthor to any Unknown messages
+        // This handles continuation messages that don't have author elements
+        if (this.lastKnownAuthor) {
+            for (let i = 0; i < messages.length; i++) {
+                const msg = messages[i];
+                if (msg.author === 'Unknown') {
+                    // Check if previous message has a known author
+                    if (i > 0 && messages[i-1].author !== 'Unknown' && messages[i-1].author !== this.botName) {
+                        msg.author = messages[i-1].author;
+                        logger.debug(`Applied author from previous message: ${msg.author}`);
+                    } else {
+                        // Use the last known author
+                        msg.author = this.lastKnownAuthor;
+                        logger.debug(`Applied last known author to Unknown message: ${this.lastKnownAuthor}`);
+                    }
+                } else if (msg.author !== 'Unknown' && msg.author !== this.botName) {
+                    // Update last known author as we go through messages
+                    this.lastKnownAuthor = msg.author;
+                }
+            }
+        }
+        
         const newMessages = [];
         let foundLast = !this.lastMessageId;
         
-        for (const msg of messages) {
-            if (!foundLast) {
-                if (msg.id === this.lastMessageId) {
-                    foundLast = true;
+        // If this is startup and we have no lastMessageId, limit messages based on config
+        if (this.isStartup && !this.lastMessageId && this.startupMessageLimit >= 0 && messages.length > this.startupMessageLimit) {
+            if (this.startupMessageLimit === 0) {
+                logger.info(`Startup mode: Skipping all ${messages.length} existing messages (STARTUP_MESSAGE_LIMIT=0)`);
+                // Don't process any messages, just update lastMessageId
+            } else {
+                logger.info(`Startup mode: Limiting initial processing to last ${this.startupMessageLimit} messages out of ${messages.length} total`);
+                // Get only the last N messages
+                const startIndex = messages.length - this.startupMessageLimit;
+                for (let i = startIndex; i < messages.length; i++) {
+                    const msg = messages[i];
+                    
+                    // Author has already been resolved in the preprocessing step
+                    if (msg.author !== this.botName && msg.content && msg.content.length > 0) {
+                        newMessages.push(msg);
+                    }
                 }
-                continue;
             }
-            
-            // If author is Unknown, use the last known author
-            if (msg.author === 'Unknown' && this.lastKnownAuthor) {
-                msg.author = this.lastKnownAuthor;
-                logger.debug(`Using previous author name: ${this.lastKnownAuthor}`);
-            } else if (msg.author !== 'Unknown') {
-                // Update last known author when we find a valid name
-                this.lastKnownAuthor = msg.author;
+        } else if (this.isStartup && !this.lastMessageId && this.startupMessageLimit < 0) {
+            // Negative value means process all messages on startup
+            logger.info(`Startup mode: Processing all ${messages.length} messages (STARTUP_MESSAGE_LIMIT=${this.startupMessageLimit})`);
+            for (const msg of messages) {
+                // Author has already been resolved in the preprocessing step
+                if (msg.author !== this.botName && msg.content && msg.content.length > 0) {
+                    newMessages.push(msg);
+                }
             }
-            
-            if (msg.author !== this.botName && msg.content && msg.content.length > 0) {
-                newMessages.push(msg);
+        } else {
+            // Normal operation: process all new messages after lastMessageId
+            for (const msg of messages) {
+                if (!foundLast) {
+                    if (msg.id === this.lastMessageId) {
+                        foundLast = true;
+                    }
+                    continue;
+                }
+                
+                // Author has already been resolved in the preprocessing step
+                if (msg.author !== this.botName && msg.content && msg.content.length > 0) {
+                    newMessages.push(msg);
+                }
             }
         }
 
@@ -422,87 +691,44 @@ class DiscordAgent {
         return chunks;
     }
 
-    async processWithClaude(message) {
-        // Format the message for Discord context
-        const prompt = `[Discord message from ${message.author}]: ${message.content}`;
-        
-        // Create a temporary file for the prompt to avoid escaping issues
-        const tempDir = os.tmpdir();
-        const tempFile = path.join(tempDir, `claude-prompt-${Date.now()}.txt`);
+    async processWithAgent(message) {
+        // Store the message author for response formatting
+        this.lastMessageAuthor = message.author;
         
         try {
-            logger.info(`Processing message with Claude: ${message.content.substring(0, 50)}...`);
+            logger.info(`Processing message with ${this.agentType}: ${message.content.substring(0, 50)}...`);
             
-            // Write prompt to temporary file
-            await fs.writeFile(tempFile, prompt, 'utf8');
-            logger.info(`Wrote prompt to temp file: ${tempFile}`);
+            // Process message with the AI agent
+            const result = await this.agent.processMessage(message);
             
-            // Build the command based on conversation mode
-            const isWindows = process.platform === 'win32';
-            const catCommand = isWindows ? 'type' : 'cat';
-            let command;
-            
-            if (this.useConversationMode && this.claudeSessionId) {
-                // Continue existing conversation
-                command = `${catCommand} "${tempFile}" | claude -c -p - --model ${this.claudeModel}`;
-                logger.info(`Continuing conversation in existing session`);
-            } else if (this.useConversationMode) {
-                // Start new conversation (first message)
-                command = `${catCommand} "${tempFile}" | claude -p - --model ${this.claudeModel}`;
-                logger.info(`Starting new conversation session`);
-                // After first message, subsequent messages will use -c flag
-                this.claudeSessionId = 'active';
-            } else {
-                // One-shot mode (no conversation memory)
-                command = `${catCommand} "${tempFile}" | claude -p - --model ${this.claudeModel} --max-turns ${this.claudeMaxTurns}`;
-                logger.info(`Using one-shot mode (no conversation memory)`);
-            }
-            
-            logger.info(`Running command: claude with prompt from file`);
-            
-            const { stdout, stderr } = await execAsync(command, {
-                maxBuffer: 1024 * 1024 * 10,
-                timeout: 60000,
-                windowsHide: true,
-                shell: process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
-            });
-            
-            // Clean up temp file
-            try {
-                await fs.unlink(tempFile);
-            } catch (e) {
-                logger.debug(`Could not delete temp file: ${e.message}`);
-            }
-            
-            if (stderr) {
-                logger.error(`Claude stderr: ${stderr}`);
-            }
-            
-            const response = stdout.trim();
-            
-            if (response) {
-                logger.info(`Claude raw output length: ${response.length} chars`);
-                return response;
-            } else {
-                logger.warn('Claude returned empty response');
+            if (!result) {
+                logger.warn('Agent returned null response');
                 return null;
             }
-        } catch (error) {
-            // Try to clean up temp file on error
-            try {
-                await fs.unlink(tempFile);
-            } catch (e) {
-                // Ignore cleanup errors
+            
+            if (result.isError) {
+                logger.error(`Agent error: ${result.result}`);
+                return this.agent.formatError(message.author, result.result);
             }
             
-            logger.error(`Claude processing error: ${error.message}`);
+            // Format the response with author mention and cost
+            const formattedResponse = this.agent.formatResponse(
+                message.author,
+                result.cost || 0,
+                result.result
+            );
+            
+            logger.info(`Response cost: $${(result.cost || 0).toFixed(2)}`);
+            return formattedResponse;
+            
+        } catch (error) {
+            logger.error(`Agent processing error: ${error.message}`);
             logger.error(`Error details: ${error.stack}`);
             
-            if (error.message.includes('not found') || error.message.includes('is not recognized')) {
-                return 'Error: Claude CLI not found. Please check installation.';
-            }
-            
-            return `Sorry, I encountered an error processing your message: ${error.message}`;
+            return this.agent.formatError(
+                message.author,
+                `Sorry, I encountered an error processing your message: ${error.message}`
+            );
         }
     }
 
@@ -515,6 +741,12 @@ class DiscordAgent {
             try {
                 const newMessages = await this.getNewMessages();
                 
+                // After the first message fetch, disable startup mode
+                if (this.isStartup) {
+                    this.isStartup = false;
+                    logger.info('Startup message processing complete. Switching to normal operation mode.');
+                }
+                
                 for (const msg of newMessages) {
                     // Skip messages FROM the filtered user to prevent loops
                     if (this.filterMentions && msg.author.toLowerCase() === this.filterMentions.toLowerCase()) {
@@ -524,8 +756,8 @@ class DiscordAgent {
                     
                     logger.info(`New message from ${msg.author}: ${msg.content}`);
                     
-                    // Process ALL messages with Claude
-                    const response = await this.processWithClaude(msg);
+                    // Process ALL messages with the AI agent
+                    const response = await this.processWithAgent(msg);
                     
                     if (response) {
                         // Check if message mentions the filter target
@@ -536,7 +768,7 @@ class DiscordAgent {
                         if (this.testingMode || !shouldSendToDiscord) {
                             // Log to console only (testing mode OR no mention)
                             const reason = this.testingMode ? 'TESTING MODE' : 'NO MENTION';
-                            logger.info(`==== CLAUDE RESPONSE (${reason} - NOT SENT) ====`);
+                            logger.info(`==== AGENT RESPONSE (${reason} - NOT SENT) ====`);
                             logger.info(response);
                             logger.info('====================================================');
                         } else {
@@ -572,13 +804,21 @@ async function main() {
         targetChannel: process.env.DISCORD_CHANNEL,
         botName: process.env.BOT_NAME || 'ClaudeAgent',
         responseDelay: parseInt(process.env.RESPONSE_DELAY) || 2000,
+        
+        // Agent configuration
+        agentType: process.env.AGENT_TYPE || 'claude',  // 'claude' or 'gemini' (future)
         claudeModel: process.env.CLAUDE_MODEL || 'sonnet',
         claudeMaxTurns: parseInt(process.env.CLAUDE_MAX_TURNS) || 5,
+        
         skip2FA: process.env.SKIP_2FA === 'true',
         testingMode: process.env.TESTING_MODE === 'true',
         filterMentions: process.env.FILTER_MENTIONS || null,
-        useConversationMode: process.env.USE_CONVERSATION_MODE !== 'false'  // Default to true
+        useConversationMode: process.env.USE_CONVERSATION_MODE !== 'false',  // Default to true
+        startupMessageLimit: process.env.STARTUP_MESSAGE_LIMIT !== undefined ? parseInt(process.env.STARTUP_MESSAGE_LIMIT) : 0  // Default to 0, can be 0 to skip all, or -1 to process all
     };
+    
+    // Log agent type
+    logger.info(`🤖 AGENT TYPE: ${config.agentType.toUpperCase()}`);
     
     if (config.testingMode) {
         logger.info('🧪 TESTING MODE ENABLED - Responses will NOT be sent to Discord');
@@ -589,9 +829,18 @@ async function main() {
     }
     
     if (config.useConversationMode) {
-        logger.info('💬 CONVERSATION MODE - Claude will remember context across messages');
+        logger.info('💬 CONVERSATION MODE - Agent will remember context across messages');
     } else {
         logger.info('📝 ONE-SHOT MODE - Each message processed independently');
+    }
+    
+    // Log startup message limit configuration
+    if (config.startupMessageLimit === 0) {
+        logger.info('🚀 STARTUP: Will skip all existing messages (STARTUP_MESSAGE_LIMIT=0)');
+    } else if (config.startupMessageLimit < 0) {
+        logger.info('🚀 STARTUP: Will process ALL existing messages (STARTUP_MESSAGE_LIMIT<0)');
+    } else {
+        logger.info(`🚀 STARTUP: Will process last ${config.startupMessageLimit} messages (STARTUP_MESSAGE_LIMIT=${config.startupMessageLimit})`);
     }
 
     if (!config.discordEmail || !config.discordPassword || !config.targetChannel) {
